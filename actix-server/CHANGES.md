@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix graceful shutdown dropping a connection that a worker received before the accept thread counted it.
+
 ## 2.9.7
 
 - Fix busy listeners starving other listeners when worker connection capacity becomes available by rotating the first listener checked.

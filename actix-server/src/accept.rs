@@ -360,11 +360,14 @@ impl Accept {
     fn send_connection(&mut self, conn: Conn) -> Result<(), Conn> {
         let next = self.next();
 
+        // Count the connection before the worker can receive it, so a worker handling a stop
+        // command never holds a connection that is missing from its count.
+        let below_limit = next.inc_counter();
+
         match next.send(conn) {
             Ok(_) => {
-                // Increment counter of WorkerHandle.
-                // Set worker to unavailable with it hit max (Return false).
-                if !next.inc_counter() {
+                // Set worker to unavailable when it hit max.
+                if !below_limit {
                     let idx = next.idx();
                     self.avail.set_available(idx, false);
                 }
@@ -372,6 +375,9 @@ impl Accept {
                 Ok(())
             }
             Err(conn) => {
+                // The worker never received the connection.
+                next.dec_counter();
+
                 // Worker thread is error and could be gone.
                 // Remove worker handle and notify `ServerBuilder`.
                 self.remove_next();
@@ -499,4 +505,107 @@ fn connection_error(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::ConnectionRefused
         || err.kind() == io::ErrorKind::ConnectionAborted
         || err.kind() == io::ErrorKind::ConnectionReset
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net,
+        sync::{Arc, Mutex},
+        task::{Context, Wake, Waker},
+    };
+
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    use super::*;
+    use crate::{
+        socket::MioStream,
+        worker::{handle_pair, Counter},
+    };
+
+    struct CountOnWake {
+        counter: Counter,
+        observed: Mutex<Vec<usize>>,
+    }
+
+    impl Wake for CountOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observed.lock().unwrap().push(self.counter.total());
+        }
+    }
+
+    fn connection() -> Conn {
+        let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+
+        Conn {
+            io: MioStream::Tcp(mio::net::TcpStream::from_std(stream)),
+            token: 0,
+        }
+    }
+
+    fn worker(idx: usize) -> (WorkerHandleAccept, UnboundedReceiver<Conn>, Counter) {
+        let (conn_tx, conn_rx) = unbounded_channel();
+        let (stop_tx, _) = unbounded_channel();
+        let counter = Counter::new(25600);
+        let (handle, _) = handle_pair(idx, conn_tx, stop_tx, counter.clone());
+
+        (handle, conn_rx, counter)
+    }
+
+    fn accept(handles: Vec<WorkerHandleAccept>) -> Accept {
+        let poll = Poll::new().unwrap();
+        let waker_queue = WakerQueue::new(poll.registry()).unwrap();
+        let (cmd_tx, _) = unbounded_channel();
+
+        let (accept, _) = Accept::new_with_sockets(
+            poll,
+            waker_queue,
+            Vec::new(),
+            handles,
+            ServerHandle::new(cmd_tx),
+        )
+        .unwrap();
+
+        accept
+    }
+
+    #[test]
+    fn connection_is_counted_before_worker_can_receive_it() {
+        let (handle, mut conn_rx, counter) = worker(0);
+        let mut accept = accept(vec![handle]);
+
+        let recorder = Arc::new(CountOnWake {
+            counter,
+            observed: Mutex::new(Vec::new()),
+        });
+        let waker = Waker::from(Arc::clone(&recorder));
+        assert!(conn_rx
+            .poll_recv(&mut Context::from_waker(&waker))
+            .is_pending());
+
+        accept.send_connection(connection()).unwrap();
+
+        assert_eq!(*recorder.observed.lock().unwrap(), [1]);
+    }
+
+    #[test]
+    fn connection_count_is_restored_when_worker_is_gone() {
+        let (gone, gone_rx, gone_counter) = worker(0);
+        let (live, mut live_rx, live_counter) = worker(1);
+        drop(gone_rx);
+        let mut accept = accept(vec![gone, live]);
+
+        let conn = accept.send_connection(connection()).unwrap_err();
+        assert_eq!(gone_counter.total(), 0);
+
+        accept.send_connection(conn).unwrap();
+        assert_eq!(live_counter.total(), 1);
+        assert!(live_rx.try_recv().is_ok());
+    }
 }

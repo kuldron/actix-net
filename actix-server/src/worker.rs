@@ -51,7 +51,7 @@ pub(crate) struct Conn {
 }
 
 /// Create accept and server worker handles.
-fn handle_pair(
+pub(crate) fn handle_pair(
     idx: usize,
     conn_tx: UnboundedSender<Conn>,
     stop_tx: UnboundedSender<Stop>,
@@ -70,23 +70,20 @@ fn handle_pair(
 
 /// Shared connection counter for the accept thread and one server worker.
 ///
-/// The accept thread increments the counter after it sends a connection to the worker. The worker
-/// decrements the counter when the connection's guard is dropped.
+/// The accept thread increments the counter before it sends a connection to the worker, so the
+/// count includes every connection the worker can receive. The worker decrements the counter when
+/// the connection's guard is dropped.
 ///
 /// # Worker Availability From The Accept Thread's Perspective
 ///
 /// The accept thread has access to each worker's counter through [`WorkerHandleAccept`], but uses
-/// its cached [`Availability`] flags to choose a worker. After it sends a connection, it increments
+/// its cached [`Availability`] flags to choose a worker. Before it sends a connection, it increments
 /// that worker's counter. If the increment reaches the connection limit, it marks the worker
 /// unavailable and stops sending it connections until the worker reports that capacity is available.
 ///
 /// # Counter Offset
 ///
-/// The raw counter starts at one to prevent an underflow during the following (race) condition. An
-/// idle worker has a raw count of one. If it receives and finishes a connection before the accept
-/// thread increments the counter, dropping the connection's guard changes the raw count from one to
-/// zero. Another read can observe zero until the accept thread performs the pending increment,
-/// which restores the idle value of one.
+/// The raw counter starts at one, so an idle worker has a raw count of one.
 ///
 /// # Restoring Worker Availability
 ///
@@ -102,8 +99,7 @@ fn handle_pair(
 pub(crate) struct Counter {
     /// Raw counter value.
     ///
-    /// Always one higher than the actual connection count except in the rare race condition
-    /// described in the struct docs.
+    /// Always one higher than the actual connection count.
     counter: Arc<AtomicUsize>,
 
     /// The connection limit.
@@ -211,6 +207,14 @@ impl WorkerHandleAccept {
     #[inline(always)]
     pub(crate) fn inc_counter(&self) -> bool {
         self.counter.inc()
+    }
+
+    /// Reverts an increment for a connection the worker did not receive.
+    ///
+    /// The worker is not notified of the capacity this releases.
+    #[inline(always)]
+    pub(crate) fn dec_counter(&self) {
+        self.counter.dec();
     }
 }
 
