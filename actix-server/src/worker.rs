@@ -81,10 +81,6 @@ pub(crate) fn handle_pair(
 /// that worker's counter. If the increment reaches the connection limit, it marks the worker
 /// unavailable and stops sending it connections until the worker reports that capacity is available.
 ///
-/// # Counter Offset
-///
-/// The raw counter starts at one, so an idle worker has a raw count of one.
-///
 /// # Restoring Worker Availability
 ///
 /// When a decrement takes the connection count below the limit (signalled by the return value of
@@ -97,9 +93,7 @@ pub(crate) fn handle_pair(
 /// [`dec`]: Self::dec
 #[derive(Clone)]
 pub(crate) struct Counter {
-    /// Raw counter value.
-    ///
-    /// Always one higher than the actual connection count.
+    /// Number of connections sent to the worker and not yet finished.
     counter: Arc<AtomicUsize>,
 
     /// The connection limit.
@@ -109,19 +103,19 @@ pub(crate) struct Counter {
 impl Counter {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
-            counter: Arc::new(AtomicUsize::new(1)),
+            counter: Arc::new(AtomicUsize::new(0)),
             limit,
         }
     }
 
     /// Increments the counter by one.
     ///
-    /// Returns true if connection limit was reached with this increment.
+    /// Returns false if the connection limit was reached with this increment.
     #[inline(always)]
     pub(crate) fn inc(&self) -> bool {
         let prev = self.counter.fetch_add(1, Ordering::Relaxed);
 
-        prev != self.limit
+        prev + 1 != self.limit
     }
 
     /// Decrements the counter by one.
@@ -131,12 +125,12 @@ impl Counter {
     pub(crate) fn dec(&self) -> bool {
         let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
 
-        Some(prev) == self.limit.checked_add(1)
+        prev == self.limit
     }
 
     /// Returns number of connections currently being handled.
     pub(crate) fn total(&self) -> usize {
-        self.counter.load(Ordering::SeqCst) - 1
+        self.counter.load(Ordering::SeqCst)
     }
 }
 
