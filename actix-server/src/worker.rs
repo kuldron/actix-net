@@ -205,7 +205,10 @@ impl WorkerHandleAccept {
 
     #[inline(always)]
     pub(crate) fn send(&self, conn: Conn) -> Result<(), Conn> {
-        self.conn_tx.send(conn).map_err(|msg| msg.0)
+        let sent = self.conn_tx.send(conn).map_err(|msg| msg.0);
+        #[cfg(test)]
+        std::thread::sleep(Duration::from_secs(1));
+        sent
     }
 
     #[inline(always)]
@@ -732,7 +735,45 @@ fn wrap_worker_services(services: Vec<(usize, usize, BoxedServerService)>) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::Counter;
+    use actix_rt::{net::TcpStream, time::sleep};
+    use actix_service::fn_service;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+    use crate::{Server, TestServer};
+
+    #[actix_rt::test]
+    async fn graceful_stop_serves_connection_received_before_it_was_counted() {
+        let (lst, addr) = TestServer::unused_listener();
+        let (entered_tx, mut entered_rx) = unbounded_channel();
+
+        let srv = Server::build()
+            .workers(1)
+            .disable_signals()
+            .listen("test", lst, move || {
+                let entered_tx = entered_tx.clone();
+                fn_service(move |mut io: TcpStream| {
+                    let entered_tx = entered_tx.clone();
+                    async move {
+                        entered_tx.send(()).unwrap();
+                        sleep(Duration::from_millis(500)).await;
+                        io.write_all(b"served").await
+                    }
+                })
+            })
+            .unwrap()
+            .run();
+        let handle = srv.handle();
+        actix_rt::spawn(srv);
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        entered_rx.recv().await.unwrap();
+        handle.stop(true).await;
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert_eq!(response, "served");
+    }
 
     #[test]
     fn max_connection_limit_allows_connection_completion() {
